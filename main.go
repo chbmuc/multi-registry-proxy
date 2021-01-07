@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -26,7 +27,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"strings"
 )
 
 const (
@@ -40,8 +40,7 @@ var (
 )
 
 type registryConfig struct {
-	host       string
-	repoPrefix string
+	host string
 }
 
 func main() {
@@ -55,14 +54,9 @@ func main() {
 	if registryHost == "" {
 		log.Fatal("REGISTRY_HOST environment variable not specified (example: gcr.io)")
 	}
-	repoPrefix := os.Getenv("REPO_PREFIX")
-	if repoPrefix == "" {
-		log.Fatal("REPO_PREFIX environment variable not specified")
-	}
 
 	reg := registryConfig{
-		host:       registryHost,
-		repoPrefix: repoPrefix,
+		host: registryHost,
 	}
 
 	tokenEndpoint, err := discoverTokenService(reg.host)
@@ -88,7 +82,7 @@ func main() {
 		mux.Handle("/", browserRedirectHandler(reg))
 	}
 	if tokenEndpoint != "" {
-		mux.Handle("/_token", tokenProxyHandler(tokenEndpoint, repoPrefix))
+		mux.Handle("/_token", tokenProxyHandler(tokenEndpoint))
 	}
 	mux.Handle("/v2/", registryAPIProxy(reg, auth))
 
@@ -137,7 +131,7 @@ func captureHostHeader(next http.Handler) http.Handler {
 // It adjusts the ?scope= parameter in the query from "repository:foo:..." to
 // "repository:repoPrefix/foo:.." and reverse proxies the query to the specified
 // tokenEndpoint.
-func tokenProxyHandler(tokenEndpoint, repoPrefix string) http.HandlerFunc {
+func tokenProxyHandler(tokenEndpoint string) http.HandlerFunc {
 	return (&httputil.ReverseProxy{
 		FlushInterval: -1,
 		Director: func(r *http.Request) {
@@ -148,8 +142,6 @@ func tokenProxyHandler(tokenEndpoint, repoPrefix string) http.HandlerFunc {
 			if scope == "" {
 				return
 			}
-			newScope := strings.Replace(scope, "repository:", fmt.Sprintf("repository:%s/", repoPrefix), 1)
-			q.Set("scope", newScope)
 			u, _ := url.Parse(tokenEndpoint)
 			u.RawQuery = q.Encode()
 			r.URL = u
@@ -165,7 +157,7 @@ func tokenProxyHandler(tokenEndpoint, repoPrefix string) http.HandlerFunc {
 // entered into the browser, like GCR (gcr.io/google-containers/busybox).
 func browserRedirectHandler(cfg registryConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		url := fmt.Sprintf("https://%s/%s%s", cfg.host, cfg.repoPrefix, r.RequestURI)
+		url := fmt.Sprintf("https://%s%s", cfg.host, r.RequestURI)
 		http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 	}
 }
@@ -192,12 +184,20 @@ func handleRegistryAPIVersion(w http.ResponseWriter, r *http.Request) {
 func rewriteRegistryV2URL(c registryConfig) func(*http.Request) {
 	return func(req *http.Request) {
 		u := req.URL.String()
-		req.Host = c.host
 		req.URL.Scheme = "https"
-		req.URL.Host = c.host
-		if req.URL.Path != "/v2/" {
-			req.URL.Path = re.ReplaceAllString(req.URL.Path, fmt.Sprintf("/v2/%s/", c.repoPrefix))
+
+		q := req.URL.Query()
+		namespace := q.Get("ns")
+		q.Del("ns")
+
+		if namespace == "docker.io" {
+			namespace = c.host
 		}
+
+		req.Host = namespace
+		req.URL.Host = namespace
+		req.URL.RawQuery = q.Encode()
+
 		log.Printf("rewrote url: %s into %s", u, req.URL)
 	}
 }
@@ -218,15 +218,32 @@ func (rrt *registryRoundtripper) RoundTrip(req *http.Request) (*http.Response, e
 		req.Header.Set("user-agent", "gcr-proxy/0.1 customDomain/"+origHost+" "+ua)
 	}
 
-	resp, err := http.DefaultTransport.RoundTrip(req)
-	if err == nil {
-		log.Printf("request completed (status=%d) url=%s", resp.StatusCode, req.URL)
-	} else {
-		log.Printf("request failed with error: %+v", err)
-		return nil, err
+	for i := 0; i < 10; i++ {
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err == nil {
+			log.Printf("request completed (status=%d) url=%s", resp.StatusCode, req.URL)
+		} else {
+			log.Printf("request failed with error: %+v", err)
+			return nil, err
+		}
+		updateTokenEndpoint(resp, origHost)
+
+		// follow redirects
+		if resp.StatusCode == 307 || resp.StatusCode == 308 {
+			log.Printf("Following redirect")
+			newurl, err := resp.Location()
+			if err != nil {
+				log.Printf("Redirected but no new location: %s", err)
+				return resp, nil
+			}
+			req.Host = newurl.Host
+			req.URL = newurl
+		} else {
+			return resp, nil
+		}
 	}
-	updateTokenEndpoint(resp, origHost)
-	return resp, nil
+
+	return nil, errors.New("To many redirects")
 }
 
 // updateTokenEndpoint modifies the response header like:
