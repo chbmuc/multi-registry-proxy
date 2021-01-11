@@ -15,8 +15,6 @@ To forward all requests through the proxy. You can apply the following settings 
 
 ```
 [plugins.cri.registry.mirrors]
-  [plugins.cri.registry.mirrors."docker.io"]
-    endpoint = ["https://registry-1.docker.io"]
   [plugins.cri.registry.mirrors."*"]
     endpoint = ["https://HostIP:Port"]
 ```
@@ -25,11 +23,11 @@ To forward all requests through the proxy. You can apply the following settings 
 
 Download the source code, and build as a container image:
 
-    docker build --tag gcr.io/[YOUR_PROJECT]/gcr-proxy .
+    docker build --tag [YOUR_REGISTRY]/[YOUR_PROJECT]/multi-registry-proxy .
 
 Then, push to a registry like:
 
-    docker push gcr.io/[YOUR_PROJECT]/gcr-proxy
+    docker push [YOUR_REGISTRY]/[YOUR_PROJECT]/multi-registry-proxy
 
 ## Configuration
 
